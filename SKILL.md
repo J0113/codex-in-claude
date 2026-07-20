@@ -7,7 +7,9 @@ description: Delegate work to the OpenAI Codex CLI (`codex`, confirmed installed
 
 Two ways to bring OpenAI's Codex CLI into a Claude Code session, as a second
 opinion or a second pair of hands. They are deliberately kept separate:
-**codex-review never writes anything**, **codex-delegate writes for real**.
+**codex-review cannot write workspace files**, **codex-delegate writes for
+real**. Review uses a temporary output file that is deleted on exit and runs
+Codex with `--ephemeral`, so no resumable session is persisted.
 
 ## The one rule that applies to both
 
@@ -41,15 +43,12 @@ setup changes, `~/.codex/models_cache.json` and the `model` line in
 
 ## Workflow 1: codex-review (read-only)
 
-Codex critiques something without touching disk. Four cases, one script:
-[scripts/codex-review.sh](scripts/codex-review.sh). It forces the sandbox
-to read-only via `-c sandbox_mode="read-only"` on every call -- **not**
-`-s read-only`, because `codex exec review` has no `-s/--sandbox` flag at
-all (confirmed: it hard-errors on `-s`). The config-key override is the
-only way to force it, and forcing it matters: Codex persists a per-project
-`trust_level` in `~/.codex/config.toml`, and a directory that was previously
-used for codex-delegate can otherwise silently default review to
-workspace-write instead of read-only.
+Codex critiques something without changing workspace files. Four cases, one
+script: [scripts/codex-review.sh](scripts/codex-review.sh). Custom artifact
+review uses general `codex exec -s read-only`. Git review uses
+`-c sandbox_mode="read-only"` because `codex exec review` has no
+`-s/--sandbox` flag. Forcing the sandbox matters: a per-project trust setting
+could otherwise select workspace-write.
 
 The script also always passes `--skip-git-repo-check`, so review works even
 when the current directory isn't a git repo (harmless for read-only work --
@@ -75,10 +74,11 @@ scripts/codex-review.sh --mode custom --file "$PLAN_FILE" \
   --model gpt-5.6-sol --effort high
 ```
 
-The script pipes the file to Codex via stdin (`codex exec review -`) rather
-than passing it as a shell argument -- a plan can be long markdown with
-quotes, backticks, and code fences, all of which mangle badly as a literal
-CLI arg. `--mode custom` is also how you'd review any other arbitrary text
+The script pipes the file to general `codex exec -s read-only -`, prefixed
+with an explicit critique instruction, rather than passing it as a shell
+argument. Do not use `codex exec review` for this case: that command treats
+its prompt as instructions for reviewing the current git repository, not as
+the artifact itself. `--mode custom` is also how you'd review arbitrary text
 (a spec, an email, a design doc) -- write it to a temp file the same way.
 
 **Case B -- reviewing uncommitted changes.** Codex can read git state
@@ -96,10 +96,10 @@ scripts/codex-review.sh --mode base --base main --model gpt-5.6-sol --effort hig
 scripts/codex-review.sh --mode commit --commit HEAD~1 --model gpt-5.6-sol --effort high
 ```
 
-All four modes print Codex's clean final response to stdout (read via
-`-o/--output-last-message` to a temp file internally, then `cat`), not the
-raw streamed transcript -- so just read the script's stdout directly,
-you don't need a separate file read.
+All four modes use `--ephemeral` and print Codex's clean final response to
+stdout (read via `-o/--output-last-message` to a temporary file internally,
+then `cat`), not the raw streamed transcript. Read the script's stdout
+directly; you don't need a separate file read.
 
 ## Workflow 2: codex-delegate (writes for real)
 
@@ -108,10 +108,13 @@ working directory. No git worktree isolation -- same directory as this
 session, by design, so treat the permission step accordingly.
 
 **Step 1 -- guard, before even asking permission.** Run
-[scripts/codex-delegate-precheck.sh](scripts/codex-delegate-precheck.sh).
+[scripts/codex-delegate-precheck.sh](scripts/codex-delegate-precheck.sh),
+passing `--add-dir <path>` when the planned run needs an additional writable
+root.
 It exits `0`/prints `CLEAN` only when `codex` is on PATH, the cwd is inside
-a git repo, and `git status --porcelain` is empty. If it prints `DIRTY`,
-stop and show the user the listed changes -- don't propose delegating yet.
+a git repo, and `git status --porcelain` is empty in every writable repo. If
+it prints `DIRTY`, stop and show the user the listed changes -- don't propose
+delegating yet.
 The reason is practical, not paranoid: once Codex's edits land on top of
 the user's in-progress edits, there's no clean way to tell whose change is
 whose in the resulting diff.
@@ -157,10 +160,9 @@ so the sandbox mode alone is what keeps it bounded to the workspace (plus
 message, `git status --short`, and a `git diff --stat` summary, then saves
 the full diff to a temp file and prints its path. Show the user the
 message + stat summary; only pull in the full diff file (via Read) if they
-ask to see everything. Note the stat/full-diff step marks new untracked
-files intent-to-add (`git add -N`) so they actually appear in the diff --
-plain `git diff` silently omits brand-new files -- then resets the index
-back to how it was, so nothing gets left staged.
+ask to see everything. The stat/full-diff step captures new untracked files,
+staged changes, unstaged changes, and deletions through a temporary Git index.
+This makes the patch complete without modifying the real index.
 
 **Long-running tasks.** `codex exec` can take a while for a nontrivial
 task. Use your judgment on how to run it: for something you expect to
@@ -177,4 +179,6 @@ operating in -- they don't take a `-C`/cwd override. If the task needs
 Codex to touch a directory outside the current workspace root,
 `codex-delegate-run.sh` accepts `--add-dir <path>`, which maps to Codex's
 own `--add-dir` (adds another writable root without loosening the sandbox
-mode itself).
+mode itself). The added directory must be inside a clean Git repository.
+The precheck rejects dirty or non-Git added roots, and the result summary and
+full diff cover both repositories. Do not add an unaudited writable root.
